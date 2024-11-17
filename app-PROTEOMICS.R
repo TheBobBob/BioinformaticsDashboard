@@ -1,0 +1,451 @@
+library(shiny)
+library(ggplot2)
+library(plotly)
+library(clusterProfiler)
+library(readxl)
+library(tidyverse)
+library(DESeq2)
+library(biomaRt)
+library(tidyr)
+library(shinyjs)
+library(rentrez)
+library(dplyr) 
+library(ggtext)
+
+ui <- fluidPage(
+  titlePanel("Interactive Volcano Plot with Gene and GO Term Search"),
+  useShinyjs(),
+  
+  passwordInput("password", "Enter Password:", value = "", placeholder = "Password"),
+  actionButton("submit_password", "Submit"),
+  
+  uiOutput("main_ui"),
+  
+  #if you define a side_ui --> absolute panel, it would have to be defined here
+)
+
+# Server logic
+server <- function(input, output, session) {
+  # Password handling
+  correct_password <- "my_secret_password"
+  
+  observeEvent(input$submit_password, {
+    if (input$password == correct_password) {
+      showModal(modalDialog(
+        title = "Access Granted",
+        "Welcome! You can now search for genes and view the volcano plot.",
+        easyClose = TRUE,
+        footer = NULL
+      ))
+      
+      # Hide the password input and button after validation
+      shinyjs::hide("password")
+      shinyjs::hide("submit_password")
+      
+      # Main UI appears after password is correct
+      output$main_ui <- renderUI({
+        sidebarLayout(
+          sidebarPanel(
+            fluidRow(
+              fileInput("file", "Choose XLSX File", multiple = FALSE, accept = c(".xlsx", "text/xlsx")),
+              actionButton("analyze_button", "Analyze"),
+              tags$hr(),
+              textInput("gene_search", "Search for a gene or keyword (separate multiple genes with ';'):", ""),
+              actionButton("search_gene", "Search Gene"),
+              tags$hr(),
+              selectInput("GO_search", "Select a GO term:", choices = NULL),
+              actionButton("search_GO_term", "Search GO Term"),
+              tags$hr(),
+              selectInput("description_search", "Search for the name of a pathway:", choices = NULL),
+              actionButton("search_description", "Search Description"),
+              tags$hr(),
+              selectInput("keyword_search", "Choose a keyword", choices = NULL),
+              actionButton("search_keyword", "Search Keyword"),
+              sliderInput("pvalue", "P-value: ",
+                          min = 0, max = 1,
+                          value = 0.01, step = 0.00001),
+              tags$hr(),
+              sliderInput("log2fc", "Log2FoldChange: ", 
+                          min = 0.0001, max = 100, 
+                          value = 2.5, step = 0.05),
+              tags$hr(), 
+              actionButton("visualize_gse", "Visualize the GSEGO Results:")
+            )
+          ),
+          mainPanel(
+            plotlyOutput("volcanoPlot"),
+            plotOutput("dotPlot", width = "100%", height = "1000px"), 
+            plotOutput("conceptNetwork", width = "100%", height = "600px"),
+            plotOutput("heatMap", width = "100%", height = "400px"), 
+            plotOutput("upsetPlot", width = "100%", height = "1000px"),
+            plotOutput("pubmedPathwayPlot", width = "100%", height = "1500px")
+          )
+        )
+      })
+      
+      # Reactive values to store results and search criteria
+      searchValues <- reactiveValues(
+        gene_search = "",
+        GO_search = "All",
+        description_search = "",
+        df_inverted = NULL  # Store df_inverted here
+      )
+      
+      # Process uploaded file and perform DESeq2 analysis
+      observeEvent(input$analyze_button, {
+        req(input$file)  # Ensure a file is uploaded
+        
+        # Read in gene counts data
+        genecounts <- tryCatch({
+          read_excel(input$file$datapath, sheet = 1, col_names = TRUE)
+        }, error = function(e) {
+          showModal(modalDialog(title = "Error", "Could not read the Excel file.", easyClose = TRUE))
+          return(NULL)
+        })
+        
+        if (is.null(genecounts)) return(NULL)  # Stop further processing if reading failed
+        
+        genecounts <- as.data.frame(genecounts)
+        rownames(genecounts) <- genecounts[, 1]
+        genecounts <- genecounts[, -1]
+        descriptions <<- data.frame(Description = genecounts[, 1])  
+        rownames(descriptions) <- rownames(genecounts)
+        genecounts <- genecounts[, -1]  
+        num_samples <- ncol(genecounts)
+        
+        # Check if the number of samples is even
+        if (num_samples %% 2 != 0) {
+          showModal(modalDialog(
+            title = "Error",
+            "The number of samples must be even for proper grouping.",
+            easyClose = TRUE
+          ))
+          return(NULL)
+        }
+        
+        # Create the condition data frame
+        condition <- data.frame(genotype = rep(c('C', 'R'), each = num_samples / 2), row.names = colnames(genecounts))
+        
+        # Create DESeq2 dataset
+        dds <- DESeqDataSetFromMatrix(countData = genecounts, colData = condition, design = ~genotype)
+        de <- DESeq(dds)
+        res_reactive <- reactiveVal()
+        res_reactive(results(de))
+        res <<- results(de)
+        
+        # Create additional columns for plotting
+        res$pvalue_log10 <- -log10(res$pvalue)
+        pvalue_threshold <- 0.05
+        fold_change_threshold <- 2
+        
+        res$significance <- ifelse(res$pvalue < pvalue_threshold, "Significant", "Not Significant")
+        res$new_column <- rownames(res)
+        res$diffexpressed <- ifelse(res$log2FoldChange > 0, "UP", ifelse(res$log2FoldChange < 0, "DOWN", "NO_CHANGE"))
+        
+        # Generate gene list for GSEA
+        organism <- "org.Hs.eg.db"
+        original_gene_list <<- res$log2FoldChange
+        names(original_gene_list) <<- res$new_column
+        gene_list <<- na.omit(original_gene_list)
+        gene_list = sort(gene_list, decreasing = TRUE)
+        
+        # Perform GO enrichment analysis
+        gse <<- gseGO(geneList = gene_list, 
+                      ont = "ALL", 
+                      keyType = "SYMBOL", 
+                      minGSSize = 3, 
+                      maxGSSize = 800, 
+                      pvalueCutoff = 0.05, 
+                      verbose = TRUE, 
+                      OrgDb = organism, 
+                      pAdjustMethod = "none")
+        
+        # Store inverted results for GO terms in reactive values
+        searchValues$df_inverted <- gse@result %>% separate_rows(core_enrichment, sep = "/")
+        
+        # Update GO term and description choices in UI
+        updateSelectInput(session, "GO_search", choices = unique(searchValues$df_inverted$ID))
+        updateSelectInput(session, "description_search", choices = unique(searchValues$df_inverted$Description))
+        updateSelectInput(session, "keyword_search", choices = unique(descriptions$Description)) #needs to have the descriptions?
+        
+        # Reactive filtering logic based on user input
+        filteredRes <- reactive({
+          data <- as.data.frame(res)
+          
+          # Apply gene search filter (optional)
+          if (searchValues$gene_search != "") {
+            genes <- strsplit(searchValues$gene_search, ";")[[1]]
+            genes <- trimws(genes)
+            if (length(genes) > 0) {
+              data <- data %>%
+                filter(rowSums(sapply(genes, function(gene) grepl(gene, new_column, ignore.case = TRUE))) > 0)
+            }
+          }
+          
+          # Apply GO term filter (optional)
+          if (searchValues$GO_search != "All") {
+            selected_genes <- searchValues$df_inverted %>%
+              filter(ID == searchValues$GO_search) %>%
+              pull(core_enrichment)
+            data <- data %>%
+              filter(new_column %in% selected_genes)
+          }
+          
+          # Apply description search filter (optional)
+          if (searchValues$description_search != "") {
+            selected_genes <- searchValues$df_inverted %>%
+              filter(Description == searchValues$description_search) %>%
+              pull(core_enrichment)
+            data <- data %>%
+              filter(new_column %in% selected_genes)
+          }
+          
+          # Apply keyword search filter using the descriptions dataframe
+          if (searchValues$keyword_search != "") {
+            # Ensure that there are actual keywords to search for
+            keywords <- strsplit(searchValues$keyword_search, ";")[[1]]
+            keywords <- trimws(keywords)
+            
+            # If there are no keywords, don't filter
+            if (length(keywords) > 0) {
+              matching_genes <- rownames(descriptions)[
+                sapply(keywords, function(keyword) {
+                  any(grepl(keyword, descriptions$Description, ignore.case = TRUE))
+                })
+              ]
+              data <- data %>%
+                filter(rownames(data) %in% matching_genes)
+            }
+          } #think the length problem is here
+          return(data)
+        })
+        
+        
+        # Render volcano plot based on filtered results
+        # Render volcano plot based on filtered results
+        output$volcanoPlot <- renderPlotly({
+          data_res <- filteredRes()
+          if (nrow(data_res) == 0) {
+            showModal(modalDialog(title = "No Data", "No data available after filtering.", easyClose = TRUE))
+            return(NULL)
+          }
+          p <- ggplot(data_res, aes(x = log2FoldChange, y = pvalue_log10, 
+                                    text = paste("Gene:", new_column, "<br>Log2 Fold Change:", log2FoldChange, 
+                                                 "<br>P-value:", pvalue, "<br>Significance:", significance, 
+                                                 "<br>Differentially Expressed:", diffexpressed, "<br>-log10 Values:", pvalue_log10))) +
+            geom_point(aes(color = log2FoldChange, shape = diffexpressed)) +
+            geom_hline(yintercept = -log10(p_value), linetype = "dotted", color = "red") +
+            geom_vline(xintercept = c(-log2fc, log2fc), linetype = "dotted", color = "darkblue") +
+            xlim(-5, 5) +
+            xlab("Log2 Fold Change") + 
+            ylab("-log10(P-value)") +
+            ggtitle("Volcano Plot") +
+            scale_color_gradient2(low = "green", mid = "pink", high = "blue", midpoint = 0, 
+                                  name = "Log2 Fold Change")
+          ggplotly(p, tooltip = "text")
+        })
+      })
+      
+      # Update search criteria based on user actions
+      observeEvent(input$search_gene, {
+        searchValues$gene_search <- input$gene_search
+        searchValues$GO_search <- "All"
+        searchValues$description_search <- ""
+      })
+      
+      observeEvent(input$search_GO_term, {
+        searchValues$GO_search <- input$GO_search
+        searchValues$gene_search <- ""
+        searchValues$description_search <- ""
+      })
+      
+      observeEvent(input$search_description, {
+        searchValues$description_search <- input$description_search
+        searchValues$GO_search <- "All"
+        searchValues$gene_search <- ""
+      })
+      
+      # When the user triggers the search
+      observeEvent(input$search_keyword, {
+        searchValues$keyword_search <- input$keyword_search
+        searchValues$gene_search <- ""  # Clear other searches to avoid conflicting filters
+        searchValues$GO_search <- "All"
+        searchValues$description_search <- ""
+      })
+      
+      observeEvent(input$visualize_gse, {
+        library(ggplot2)
+        library(ggtext)
+        library(gridExtra)
+        
+        output$dotPlot <- renderPlot({
+          txt <- "Dot Plot with 10 Pathways"
+          title_plot <- ggplot() +
+            geom_textbox(
+              aes(x = 0, y = 0, label = txt),
+              size = 18 / .pt,
+              width = unit(6, "inches")
+            ) +
+            theme_void()
+          
+          dot_plot <- dotplot(gse, showCategory = 35)
+          
+          grid.arrange(title_plot, dot_plot, ncol = 1)
+        })
+        
+        output$conceptNetwork <- renderPlot({
+          txt <- "Gene Concept Network"
+          
+          title_plot <- ggplot() +
+            geom_textbox(
+              aes(x = 0, y = 0, label = txt),
+              size = 18 / .pt,
+              width = unit(6, "inches")
+            ) + 
+            theme_void()
+          
+          gsex <- setReadable(gse, 'org.Hs.eg.db', 'ENTREZID')
+          geneList <- gse@geneList
+          
+          p1 <- cnetplot(gsex, foldChange = geneList, max.overlaps = 100)
+          p2 <- cnetplot(gsex, categorySize = "pvalue", foldChange = geneList, max.overlaps = 100)
+          p3 <- cnetplot(gsex, foldChange = geneList, circular = TRUE, colorEdge = TRUE, max.overlaps = 100)
+          
+          maingene_plot <- cowplot::plot_grid(p1, p2, p3, ncol = 3, labels = LETTERS[1:3], rel_widths = c(.8, .8, 1.2))
+          grid.arrange(title_plot, maingene_plot, ncol = 1)
+          
+          ggsave("gene_concept_network.png", width = 12, height = 8, dpi = 300)
+        })
+        
+        output$heatMap <- renderPlot({
+          txt <- "Heatmap-Like Functional Classification"
+          
+          title_plot <- ggplot() +
+            geom_textbox(
+              aes(x = 0, y = 0, label = txt),
+              size = 18 / .pt,
+              width = unit(6, "inches")
+            ) + 
+            theme_void()
+          
+          gsex <- setReadable(gse, 'org.Hs.eg.db', 'ENTREZID')
+          geneList <- gse@geneList
+          
+          p1 <- heatplot(gsex, showCategory=5)
+          p2 <- heatplot(gsex, foldChange=geneList, showCategory=5)
+          mainheatmap_plot <- cowplot::plot_grid(p1, p2, ncol=1, labels=LETTERS[1:2])
+          
+          grid.arrange(title_plot, mainheatmap_plot, ncol = 1)
+          
+          ggsave("functional_classification_heatmap.png", width = 12, height = 8, dpi = 300)
+        })
+        
+        library(cowplot)
+        
+        output$upsetPlot <- renderPlot({
+          txt <- "UpSet Plot"
+          
+          title_plot <- ggplot() +
+            geom_textbox(
+              aes(x = 0, y = 0, label = txt),
+              size = 18 / .pt,
+              width = unit(6, "inches")
+            ) + 
+            theme_void()
+          
+          gse_df <- gse@result
+          top_terms <- gse_df %>% arrange(pvalue) %>% head(10)
+          top_gene_sets <- strsplit(top_terms$core_enrichment, "/")
+          gene_sets_list <- lapply(top_gene_sets, function(x) unique(trimws(x)))
+          
+          gene_sets_df <- fromList(setNames(gene_sets_list, top_terms$ID))
+          
+          # Create the UpSet plot
+          upset_plot <- upset(gene_sets_df, 
+                              sets = names(gene_sets_df), 
+                              main.bar.color = "steelblue",
+                              sets.bar.color = "darkred", 
+                              order.by = "freq", 
+                              matrix.color = "gray",
+                              keep.order = TRUE)
+          
+          # Combine the plots using cowplot
+          plot_grid(title_plot, upset_plot, ncol = 1)
+        })
+        
+        output$pubmedPathwayPlot <- renderPlot({
+          txt <- "PubMed Pathway Enrichment"
+          
+          title_plot <- ggplot() +
+            geom_textbox(
+              aes(x = 0, y = 0, label = txt),
+              size = 18 / .pt,
+              width = unit(6, "inches")
+            ) + 
+            theme_void()
+          
+          results <- data.frame(Term = character(), Year = integer(), Count = integer(), stringsAsFactors = FALSE)
+          
+          terms <- gse$Description[1:15]  
+          
+          results <- data.frame()
+          titles_2024 <- data.frame()
+          
+          for (term in terms) {
+            for (year in 2014:2024) {
+              query <- paste(term, "[Title/Abstract] AND", year, "[PDAT]")
+              
+              # Count results for each term and year
+              search_results <- entrez_search(db = "pubmed", term = query, retmax = 0)
+              results <- rbind(results, data.frame(Term = term, Year = year, Count = search_results$count))
+              
+              # If the year is 2024, retrieve the first 10 article titles
+              if (year == 2024) {
+                search_results_2024 <- entrez_search(db = "pubmed", term = query, retmax = 10)
+                if (search_results_2024$count > 0) {
+                  article_ids <- search_results_2024$ids
+                  articles <- entrez_fetch(db = "pubmed", id = article_ids, rettype = "abstract", retmode = "text")
+                  titles <- sapply(strsplit(articles, "\n"), function(x) x[1])
+                  titles_2024 <- reactive({rbind(titles_2024, data.frame(Term = term, Title = titles, stringsAsFactors = FALSE))})
+                }
+              }
+            }
+          }
+          
+          total_counts <- results %>%
+            group_by(Year) %>%
+            summarize(Total_Count = sum(Count), .groups = 'drop')
+          
+          results <- results %>%
+            left_join(total_counts, by = "Year")
+          
+          results <- results %>%
+            mutate(Ratio = Count / Total_Count)
+          
+          print(results)
+          
+          mainpubmed_plot <- ggplot(results, aes(x = Year, y = Ratio, color = Term)) +
+            geom_line() +
+            geom_point(size = 3, shape = 20, fill = "white", stroke = 1) +  # Bolded dots
+            scale_x_continuous(limits = c(2013, 2025), breaks = seq(2013, 2025, by = 2.5)) +  # 2.5-year breaks
+            labs(title = "Publication Ratio for Enriched Terms", x = "Year", y = "Publication Ratio") +
+            theme_minimal()
+          
+          grid.arrange(title_plot, mainpubmed_plot, ncol = 1)
+          ggsave("pubmed_analysis_plot.png", width = 12, height = 8, dpi = 300)
+          
+        })
+      })
+      
+    } else {
+      showModal(modalDialog(
+        title = "Access Denied",
+        "Incorrect password. Please try again.",
+        easyClose = TRUE,
+        footer = NULL
+      ))
+    }
+  })
+}
+
+shinyApp(ui = ui, server = server)
