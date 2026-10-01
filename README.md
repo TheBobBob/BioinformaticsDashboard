@@ -1,5 +1,5 @@
 # BioinformaticsDashboard
-Instructions for downloading the dashboard can be found on the website: https://thebobbob-bioinformaticsdashboard.hf.space/
+Instructions for downloading the dashboard can be found on the website: https://thebobbob-bioinformaticsdashboard.hf.space/ along with an example tutorial
 
 BioinformaticsDashboard is an all-in-one platform to enable automated analysis and visualization of RNAseq and proteomics data. Available analysis include differential expression, and GO Term analysis. Available visualizations include volcano plots, dot plots, and GO Term publication frequency analysis.
 
